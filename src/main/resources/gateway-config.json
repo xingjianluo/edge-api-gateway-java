@@ -1,0 +1,19 @@
+{
+  "callerHeader": "X-Caller-Id",
+  "defaultTimeoutMillis": 3000,
+  "maxBodyBytes": 1048576,
+  "dedupTtlMillis": 60000,
+  "routes": [
+    {
+      "id": "health-open",
+      "method": "GET",
+      "pathPrefix": "/health",
+      "requiredHeaders": {},
+      "upstreamBaseUrl": "http://127.0.0.1:18081",
+      "stripPrefix": "/health",
+      "timeoutMillis": 2000,
+      "retries": 1,
+      "requireCaller": false
+    }
+  ]
+}

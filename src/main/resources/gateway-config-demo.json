@@ -1,0 +1,72 @@
+{
+  "callerHeader": "X-Caller-Id",
+  "defaultTimeoutMillis": 3000,
+  "maxBodyBytes": 1048576,
+  "dedupTtlMillis": 60000,
+  "routes": [
+    {
+      "id": "orders-v2",
+      "method": "ANY",
+      "pathPrefix": "/api/v2/orders",
+      "requiredHeaders": { "x-api-version": "v2" },
+      "upstreamBaseUrl": "http://127.0.0.1:18081",
+      "stripPrefix": "/api/v2/orders",
+      "timeoutMillis": 3000,
+      "retries": 2,
+      "requireCaller": true,
+      "allowedCallers": ["shop-a", "shop-b"],
+      "rateLimit": { "permitsPerWindow": 3, "windowMillis": 1000, "dailyQuota": 100 }
+    },
+    {
+      "id": "orders-v1",
+      "method": "ANY",
+      "pathPrefix": "/api/orders",
+      "requiredHeaders": {},
+      "upstreamBaseUrl": "http://127.0.0.1:18081",
+      "stripPrefix": "/api/orders",
+      "timeoutMillis": 3000,
+      "retries": 1,
+      "requireCaller": true,
+      "allowedCallers": ["shop-a"],
+      "rateLimit": { "permitsPerWindow": 2, "windowMillis": 1000, "dailyQuota": -1 }
+    },
+    {
+      "id": "flaky-get",
+      "method": "GET",
+      "pathPrefix": "/flaky",
+      "upstreamBaseUrl": "http://127.0.0.1:18082",
+      "stripPrefix": "",
+      "timeoutMillis": 2000,
+      "retries": 2,
+      "requireCaller": false
+    },
+    {
+      "id": "slow-post",
+      "method": "POST",
+      "pathPrefix": "/slow",
+      "upstreamBaseUrl": "http://127.0.0.1:18082",
+      "timeoutMillis": 300,
+      "retries": 2,
+      "requireCaller": false
+    },
+    {
+      "id": "boom",
+      "method": "GET",
+      "pathPrefix": "/boom",
+      "upstreamBaseUrl": "http://127.0.0.1:18099",
+      "timeoutMillis": 500,
+      "retries": 1,
+      "requireCaller": false
+    },
+    {
+      "id": "fallback",
+      "method": "ANY",
+      "pathPrefix": "/",
+      "upstreamBaseUrl": "http://127.0.0.1:18081",
+      "stripPrefix": "",
+      "timeoutMillis": 3000,
+      "retries": 0,
+      "requireCaller": false
+    }
+  ]
+}
