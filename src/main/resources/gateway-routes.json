@@ -1,0 +1,15 @@
+{
+  "upstreams": [
+    { "id": "local-demo", "baseUrl": "http://127.0.0.1:18080", "enabled": true }
+  ],
+  "routes": [
+    {
+      "id": "default-proxy",
+      "pathPrefix": "/",
+      "upstream": "local-demo",
+      "priority": 1000,
+      "timeoutMillis": 3000,
+      "maxRetries": 0
+    }
+  ]
+}

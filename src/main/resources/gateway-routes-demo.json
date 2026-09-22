@@ -1,0 +1,53 @@
+{
+  "upstreams": [
+    { "id": "demo", "baseUrl": "http://127.0.0.1:18080", "enabled": true }
+  ],
+  "routes": [
+    {
+      "id": "v2-orders-explicit",
+      "pathPrefix": "/api/v2/orders",
+      "methods": ["POST"],
+      "requiredHeaders": { "X-Channel": "partner" },
+      "upstream": "demo",
+      "prefixRewrite": "/__upstream/ok",
+      "priority": 10,
+      "timeoutMillis": 3000,
+      "maxRetries": 0,
+      "globalRatePerSecond": 100,
+      "callerRatePerSecond": 2,
+      "allowedCallers": ["alpha", "beta"]
+    },
+    {
+      "id": "v1-api",
+      "pathPrefix": "/api/v1",
+      "upstream": "demo",
+      "prefixRewrite": "/__upstream",
+      "priority": 20,
+      "timeoutMillis": 3000,
+      "maxRetries": 2,
+      "globalRatePerSecond": 20,
+      "callerRatePerSecond": 10,
+      "allowedCallers": ["alpha", "beta", "gamma"]
+    },
+    {
+      "id": "v2-api",
+      "pathPrefix": "/api/v2",
+      "upstream": "demo",
+      "prefixRewrite": "/__upstream",
+      "priority": 30,
+      "timeoutMillis": 3000,
+      "maxRetries": 2,
+      "globalRatePerSecond": 20,
+      "callerRatePerSecond": 10
+    },
+    {
+      "id": "health-route",
+      "pathPrefix": "/health",
+      "upstream": "demo",
+      "prefixRewrite": "/__upstream/ok",
+      "priority": 40,
+      "timeoutMillis": 1000,
+      "maxRetries": 0
+    }
+  ]
+}
