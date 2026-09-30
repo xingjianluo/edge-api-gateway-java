@@ -1,10 +1,15 @@
 package com.github.xingjianluo.edgeapigatewayjava.ratelimit;
 
+import com.github.xingjianluo.edgeapigatewayjava.config.GatewayConfig;
+import com.github.xingjianluo.edgeapigatewayjava.config.QuotaPolicy;
 import com.github.xingjianluo.edgeapigatewayjava.config.RouteConfig;
 import com.github.xingjianluo.edgeapigatewayjava.config.ConfigService;
+import com.github.xingjianluo.edgeapigatewayjava.quota.QuotaRegistry;
+import com.github.xingjianluo.edgeapigatewayjava.quota.QuotaResult;
 import com.github.xingjianluo.edgeapigatewayjava.routing.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
@@ -33,9 +38,20 @@ public class RateLimiter {
     private final Map<String, TokenBucket> callerBuckets = new ConcurrentHashMap<>();
     /** key = routeId + '|' + callerId + '|' + requestId，记录已成功计数的请求指纹。 */
     private final Map<String, Fingerprint> seenRequests = new ConcurrentHashMap<>();
+    /** 周期配额注册表；仅测试直接构造 RateLimiter 时可能为 null（此时按"无配额"处理）。 */
+    private final QuotaRegistry quotaRegistry;
 
-    public RateLimiter(ConfigService configService) {
+    /** 生产环境构造：同时接入按秒限流与周期配额。 */
+    @Autowired
+    public RateLimiter(ConfigService configService, QuotaRegistry quotaRegistry) {
+        this.quotaRegistry = quotaRegistry;
         // 任意成功的配置热更新都重建限流状态，保证新配额立即完整生效
+        configService.addSwapListener(this::reset);
+    }
+
+    /** 仅供不带周期配额的单元测试使用。 */
+    public RateLimiter(ConfigService configService) {
+        this.quotaRegistry = null;
         configService.addSwapListener(this::reset);
     }
 
@@ -53,8 +69,21 @@ public class RateLimiter {
         }
     }
 
+    /** 兼容旧入口：路由未挂周期配额策略时使用。 */
     public RateLimitDecision check(RouteConfig route, RequestContext request) {
-        boolean callerRequired = !route.allowedCallers().isEmpty() || route.callerRatePerSecond() > 0;
+        return check(route, request, null);
+    }
+
+    /**
+     * 完整判定：调用方鉴权 -> 幂等去重 -> 按秒令牌桶（调用方/路由）-> 周期配额。
+     * 周期配额与按秒桶在同一临界区内顺序完成，任何一步失败都整体回滚，绝不半扣减。
+     *
+     * @param quota 路由所属的配额策略；null 表示该路由不参与周期配额
+     */
+    public RateLimitDecision check(RouteConfig route, RequestContext request, QuotaPolicy quota) {
+        // 配额按调用方核算：挂了配额策略的路由也强制要求调用方身份
+        boolean callerRequired =
+                !route.allowedCallers().isEmpty() || route.callerRatePerSecond() > 0 || quota != null;
         String rawCaller = request.callerId();
         if (callerRequired && (rawCaller == null || rawCaller.isBlank())) {
             log.info("[ratelimit] 拒绝: 缺少 X-Caller-Id, route={}, path={}", route.id(), request.path());
@@ -85,12 +114,28 @@ public class RateLimiter {
                 }
             }
 
+            // 配额范围级的重复预检：同一 X-Request-Id 此前可能命中了本策略覆盖的"另一条"路由，
+            // 路由级去重表查不到，但周期额度已被占用过。这里在任何按秒扣减之前识别它，
+            // 统一按 REQUEST_DUPLICATED(409) 拒绝——既不发到上游，也不消耗任何额度。
+            if (quota != null && quotaRegistry != null
+                    && request.requestId() != null && !request.requestId().isBlank()
+                    && quotaRegistry.isAlreadyCharged(quota, caller, request.requestId())) {
+                log.info("[ratelimit] 拒绝: 配额范围内跨路由重复提交 policy={}, caller={}, requestId={}",
+                        quota.id(), caller, request.requestId());
+                return RateLimitDecision.reject("REQUEST_DUPLICATED",
+                        "相同 X-Request-Id 已在配额 " + quota.id() + " 覆盖的路由上处理过，拒绝重复计数");
+            }
+
+            // 使用 reserve/release：预占成功后若后续维度（路由桶/周期配额）失败，
+            // 可精确撤销，连本次预占触发的时间补充也一并回滚。
             TokenBucket callerBucket = null;
+            TokenBucket.Reservation callerReservation = null;
             if (route.callerRatePerSecond() > 0) {
                 callerBucket = callerBuckets.computeIfAbsent(
                         route.id() + "|" + caller,
                         k -> new TokenBucket(route.callerRatePerSecond()));
-                if (!callerBucket.tryAcquire()) {
+                callerReservation = callerBucket.reserve();
+                if (callerReservation == null) {
                     log.info("[ratelimit] 拒绝: caller 维度超发 route={}, caller={}, 剩余令牌={}",
                             route.id(), caller, callerBucket.availableTokens());
                     return RateLimitDecision.reject("RATE_LIMITED_CALLER",
@@ -99,13 +144,15 @@ public class RateLimiter {
             }
 
             TokenBucket globalBucket = null;
+            TokenBucket.Reservation globalReservation = null;
             if (route.globalRatePerSecond() > 0) {
                 globalBucket = globalBuckets.computeIfAbsent(
                         route.id(), k -> new TokenBucket(route.globalRatePerSecond()));
-                if (!globalBucket.tryAcquire()) {
-                    // 调用方桶已扣，需要回滚，保证两个维度要么都成功要么都不发生
+                globalReservation = globalBucket.reserve();
+                if (globalReservation == null) {
+                    // 调用方桶已预占，需要撤销，保证两个维度要么都成功要么都不发生
                     if (callerBucket != null) {
-                        callerBucket.refillOneForRollback();
+                        callerBucket.release(callerReservation);
                     }
                     log.info("[ratelimit] 拒绝: 路由维度超发 route={}, 剩余令牌={}",
                             route.id(), globalBucket.availableTokens());
@@ -114,13 +161,43 @@ public class RateLimiter {
                 }
             }
 
+            // 周期配额：按秒桶已预占成功后，在同一临界区内申请周期额度。
+            // 被周期配额拒绝时必须把两个按秒桶精确恢复到预占前状态，
+            // 保证"已拒绝却仍占用额度"绝不发生。
+            QuotaResult quotaResult = null;
+            if (quota != null && quotaRegistry != null) {
+                quotaResult = quotaRegistry.acquire(quota, caller, request.requestId());
+                if (!quotaResult.allowed()) {
+                    if (globalBucket != null) {
+                        globalBucket.release(globalReservation);
+                    }
+                    if (callerBucket != null) {
+                        callerBucket.release(callerReservation);
+                    }
+                    log.info("[ratelimit] 拒绝: 周期配额用尽已回滚按秒桶 route={}, caller={}, policy={}, used={}/{}, window={}",
+                            route.id(), caller, quota.id(), quotaResult.used(), quotaResult.limit(),
+                            quotaResult.windowStart());
+                    return RateLimitDecision.reject(quotaResult.scope(), quotaResult.reason());
+                }
+            }
+
             if (request.requestId() != null && !request.requestId().isBlank()) {
                 seenRequests.put(dedupeKey, new Fingerprint(fingerprint, System.currentTimeMillis()));
             }
-            log.info("[ratelimit] 放行 route={}, caller={}, requestId={}, callerTokens={}, globalTokens={}",
-                    route.id(), caller, request.requestId(),
-                    callerBucket == null ? "n/a" : String.format("%.2f", callerBucket.availableTokens()),
-                    globalBucket == null ? "n/a" : String.format("%.2f", globalBucket.availableTokens()));
+            if (quotaResult == null) {
+                log.info("[ratelimit] 放行 route={}, caller={}, requestId={}, callerTokens={}, globalTokens={}",
+                        route.id(), caller, request.requestId(),
+                        callerBucket == null ? "n/a" : String.format("%.2f", callerBucket.availableTokens()),
+                        globalBucket == null ? "n/a" : String.format("%.2f", globalBucket.availableTokens()));
+            } else {
+                log.info("[ratelimit] 放行 route={}, caller={}, requestId={}, callerTokens={}, globalTokens={}, "
+                                + "quota(policy={}, used={}/{}, window={}, charged={})",
+                        route.id(), caller, request.requestId(),
+                        callerBucket == null ? "n/a" : String.format("%.2f", callerBucket.availableTokens()),
+                        globalBucket == null ? "n/a" : String.format("%.2f", globalBucket.availableTokens()),
+                        quota.id(), quotaResult.used(), quotaResult.limit(), quotaResult.windowStart(),
+                        quotaResult.charged());
+            }
             return RateLimitDecision.allow();
         }
     }

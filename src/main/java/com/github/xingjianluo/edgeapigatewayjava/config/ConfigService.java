@@ -39,7 +39,8 @@ public class ConfigService {
     private final ConfigLoader loader;
     private final ConfigValidator validator;
     private final AtomicReference<GatewayConfig> current = new AtomicReference<>();
-    private final List<Runnable> swapListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final List<java.util.function.Consumer<GatewayConfig>> swapListeners =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
 
     private volatile Path watchedFile;
     private volatile long watchedLastModified = -1;
@@ -57,6 +58,9 @@ public class ConfigService {
             InitialSource source = resolveInitialSource();
             GatewayConfig cfg = parseAndValidate(source.json());
             current.set(cfg);
+            // 初始加载同样通知监听器，使有状态组件（如周期配额对账表）以初始快照为对账基线，
+            // 否则第一次（与配额无关的）热更新会把既有策略误判为"新增"而错误清空用量
+            notifySwapped(cfg);
             log.info("[config] 初始配置已加载: routes={}, upstreams={}, 来源={}",
                     cfg.routes().size(), cfg.upstreams().size(), source.description());
             if (watchedFile != null) {
@@ -77,7 +81,7 @@ public class ConfigService {
     public GatewayConfig replaceFromJson(String json) {
         GatewayConfig next = parseAndValidate(json);
         current.set(next);
-        notifySwapped();
+        notifySwapped(next);
         log.info("[config] 配置已原子热更新: routes={}, upstreams={}", next.routes().size(), next.upstreams().size());
         return next;
     }
@@ -86,7 +90,7 @@ public class ConfigService {
     public void replace(GatewayConfig next) {
         ensureValid(next);
         current.set(next);
-        notifySwapped();
+        notifySwapped(next);
     }
 
     /**
@@ -94,13 +98,20 @@ public class ConfigService {
      * 校验失败的更新不会触发监听器。
      */
     public void addSwapListener(Runnable listener) {
+        swapListeners.add(cfg -> listener.run());
+    }
+
+    /**
+     * 注册携带新快照的切换监听器（供需要按新旧差异对账状态的组件使用）。
+     */
+    public void addSwapListener(java.util.function.Consumer<GatewayConfig> listener) {
         swapListeners.add(listener);
     }
 
-    private void notifySwapped() {
-        for (Runnable l : swapListeners) {
+    private void notifySwapped(GatewayConfig next) {
+        for (java.util.function.Consumer<GatewayConfig> l : swapListeners) {
             try {
-                l.run();
+                l.accept(next);
             } catch (Exception e) {
                 log.warn("[config] 配置切换监听器执行失败: {}", e.getMessage());
             }

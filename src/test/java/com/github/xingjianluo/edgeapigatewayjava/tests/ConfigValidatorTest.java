@@ -2,6 +2,7 @@ package com.github.xingjianluo.edgeapigatewayjava.tests;
 
 import com.github.xingjianluo.edgeapigatewayjava.config.ConfigValidator;
 import com.github.xingjianluo.edgeapigatewayjava.config.GatewayConfig;
+import com.github.xingjianluo.edgeapigatewayjava.config.QuotaPolicy;
 import com.github.xingjianluo.edgeapigatewayjava.config.RouteConfig;
 import com.github.xingjianluo.edgeapigatewayjava.config.UpstreamConfig;
 import org.junit.jupiter.api.Test;
@@ -125,5 +126,65 @@ class ConfigValidatorTest {
         log.info("[用例:非法URL] baseUrl=ftp://nohost -> 错误={}", errors);
 
         assertTrue(errors.stream().anyMatch(e -> e.contains("http/https")));
+    }
+
+    // ---- 周期配额策略校验 ----
+
+    private GatewayConfig quotaConfig(List<QuotaPolicy> quotas) {
+        return new GatewayConfig(
+                List.of(route("r1", "/a", 10, "u1"), route("r2", "/b", 20, "u1")),
+                Map.of("u1", new UpstreamConfig("u1", "http://127.0.0.1:9", true)),
+                quotas);
+    }
+
+    @Test
+    void 合法共享配额策略通过校验() {
+        GatewayConfig cfg = quotaConfig(List.of(
+                new QuotaPolicy("budget", List.of("r1", "r2"), 100,
+                        QuotaPolicy.PERIOD_WEEK, "Asia/Shanghai")));
+        List<String> errors = validator.validate(cfg);
+        log.info("[用例:合法配额] WEEK/Asia/Shanghai 覆盖r1,r2 -> 错误={}", errors);
+        assertTrue(errors.isEmpty(), errors::toString);
+    }
+
+    @Test
+    void 配额引用不存在的路由被拒绝() {
+        GatewayConfig cfg = quotaConfig(List.of(
+                new QuotaPolicy("budget", List.of("r1", "ghost"), 10,
+                        QuotaPolicy.PERIOD_DAY, "UTC")));
+        List<String> errors = validator.validate(cfg);
+        log.info("[用例:配额幽灵路由] routeIds=r1,ghost -> 错误={}", errors);
+        assertTrue(errors.stream().anyMatch(e -> e.contains("不存在的路由")));
+    }
+
+    @Test
+    void 同一路由归属两份配额被拒绝() {
+        GatewayConfig cfg = quotaConfig(List.of(
+                new QuotaPolicy("q1", List.of("r1"), 10, QuotaPolicy.PERIOD_DAY, "UTC"),
+                new QuotaPolicy("q2", List.of("r1", "r2"), 20, QuotaPolicy.PERIOD_HOUR, "UTC")));
+        List<String> errors = validator.validate(cfg);
+        log.info("[用例:路由重复归属] r1 同时属于 q1/q2 -> 错误={}", errors);
+        assertTrue(errors.stream().anyMatch(e -> e.contains("最多属于一份配额")));
+    }
+
+    @Test
+    void 非法周期额度和时区被拒绝() {
+        GatewayConfig badLimit = quotaConfig(List.of(
+                new QuotaPolicy("q", List.of("r1"), 0, QuotaPolicy.PERIOD_DAY, "UTC")));
+        List<String> limitErrors = validator.validate(badLimit);
+        log.info("[用例:非法额度] limit=0 -> 错误={}", limitErrors);
+        assertTrue(limitErrors.stream().anyMatch(e -> e.contains("limit 必须为正数")));
+
+        GatewayConfig badPeriod = quotaConfig(List.of(
+                new QuotaPolicy("q", List.of("r1"), 10, "MONTH", "UTC")));
+        List<String> periodErrors = validator.validate(badPeriod);
+        log.info("[用例:非法周期] period=MONTH -> 错误={}", periodErrors);
+        assertTrue(periodErrors.stream().anyMatch(e -> e.contains("HOUR/DAY/WEEK")));
+
+        GatewayConfig badZone = quotaConfig(List.of(
+                new QuotaPolicy("q", List.of("r1"), 10, QuotaPolicy.PERIOD_DAY, "Mars/Olympus")));
+        List<String> zoneErrors = validator.validate(badZone);
+        log.info("[用例:非法时区] timeZone=Mars/Olympus -> 错误={}", zoneErrors);
+        assertTrue(zoneErrors.stream().anyMatch(e -> e.contains("IANA 时区")));
     }
 }

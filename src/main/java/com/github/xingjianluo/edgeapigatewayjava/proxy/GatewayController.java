@@ -2,6 +2,7 @@ package com.github.xingjianluo.edgeapigatewayjava.proxy;
 
 import com.github.xingjianluo.edgeapigatewayjava.config.ConfigService;
 import com.github.xingjianluo.edgeapigatewayjava.config.GatewayConfig;
+import com.github.xingjianluo.edgeapigatewayjava.config.QuotaPolicy;
 import com.github.xingjianluo.edgeapigatewayjava.config.RouteConfig;
 import com.github.xingjianluo.edgeapigatewayjava.config.UpstreamConfig;
 import com.github.xingjianluo.edgeapigatewayjava.ratelimit.RateLimitDecision;
@@ -83,8 +84,11 @@ public class GatewayController {
         }
         RouteConfig route = match.route();
 
-        // 2. 限流 / 调用方鉴权 / 幂等去重
-        RateLimitDecision decision = rateLimiter.check(route, context);
+        // 2. 限流 / 调用方鉴权 / 幂等去重 / 周期配额（同一快照内解析配额策略）
+        QuotaPolicy quota = route.quotaPolicyId() == null || route.quotaPolicyId().isBlank()
+                ? null
+                : snapshot.quotaIndex().get(route.quotaPolicyId());
+        RateLimitDecision decision = rateLimiter.check(route, context, quota);
         if (!decision.allowed()) {
             throw rejection(decision.scope(), decision.reason(), route);
         }
@@ -129,6 +133,7 @@ public class GatewayController {
             case "REQUEST_DUPLICATED" -> GatewayErrorCode.REQUEST_DUPLICATED;
             case "RATE_LIMITED_CALLER" -> GatewayErrorCode.RATE_LIMITED_CALLER;
             case "RATE_LIMITED_GLOBAL" -> GatewayErrorCode.RATE_LIMITED_GLOBAL;
+            case "QUOTA_EXHAUSTED" -> GatewayErrorCode.QUOTA_EXHAUSTED;
             default -> GatewayErrorCode.INTERNAL_ERROR;
         };
         return new GatewayException(code, reason);

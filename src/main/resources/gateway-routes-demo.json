@@ -2,6 +2,15 @@
   "upstreams": [
     { "id": "demo", "baseUrl": "http://127.0.0.1:18080", "enabled": true }
   ],
+  "quotaPolicies": [
+    {
+      "id": "partner-weekly-budget",
+      "routeIds": ["v1-api", "v2-api"],
+      "limit": 5000,
+      "period": "WEEK",
+      "timeZone": "Asia/Shanghai"
+    }
+  ],
   "routes": [
     {
       "id": "v2-orders-explicit",

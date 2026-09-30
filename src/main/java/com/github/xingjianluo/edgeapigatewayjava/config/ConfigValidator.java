@@ -3,6 +3,7 @@ package com.github.xingjianluo.edgeapigatewayjava.config;
 import org.springframework.stereotype.Component;
 
 import java.net.URI;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -30,7 +31,74 @@ public class ConfigValidator {
         }
         validateUpstreams(config, errors);
         validateRoutes(config, errors);
+        validateQuotas(config, errors);
         return errors;
+    }
+
+    /**
+     * 周期配额策略自洽校验：
+     * - id 非空且唯一；
+     * - limit 为正；period 只能是 HOUR/DAY/WEEK；timeZone 必须是合法 IANA 时区；
+     * - routeIds 非空、引用的路由必须存在、同一条路由最多归属一份策略（否则无法确定从哪份额度扣）。
+     */
+    private void validateQuotas(GatewayConfig config, List<String> errors) {
+        Set<String> quotaIds = new HashSet<>();
+        Set<String> validPeriods = Set.of(
+                QuotaPolicy.PERIOD_HOUR, QuotaPolicy.PERIOD_DAY, QuotaPolicy.PERIOD_WEEK);
+        // 路由 id 重复已在路由校验中报错，这里用容错集合，避免 toUnmodifiableMap 直接抛异常中断校验
+        Set<String> existingRouteIds = new HashSet<>();
+        for (RouteConfig r : config.routes()) {
+            existingRouteIds.add(r.id());
+        }
+        // routeId -> 已归属的策略 id
+        Map<String, String> routeOwner = new java.util.HashMap<>();
+
+        for (int i = 0; i < config.quotaPolicies().size(); i++) {
+            QuotaPolicy q = config.quotaPolicies().get(i);
+            String label = isBlank(q.id()) ? ("第" + i + "个配额策略") : "配额策略 " + q.id();
+            if (isBlank(q.id())) {
+                errors.add(label + " 缺少 id");
+            } else if (!quotaIds.add(q.id())) {
+                errors.add("配额策略 id 重复: " + q.id());
+            }
+            if (q.limit() <= 0) {
+                errors.add(label + " 的 limit 必须为正数: " + q.limit());
+            }
+            if (q.period() == null || !validPeriods.contains(q.period())) {
+                errors.add(label + " 的 period 只能是 HOUR/DAY/WEEK: " + q.period());
+            }
+            if (isBlank(q.timeZone())) {
+                errors.add(label + " 缺少 timeZone");
+            } else {
+                try {
+                    ZoneId.of(q.timeZone());
+                } catch (Exception e) {
+                    errors.add(label + " 的 timeZone 不是合法 IANA 时区: " + q.timeZone());
+                }
+            }
+            if (q.routeIds().isEmpty()) {
+                errors.add(label + " 的 routeIds 不能为空（配额至少覆盖一条路由）");
+            }
+            Set<String> withinPolicy = new HashSet<>();
+            for (String routeId : q.routeIds()) {
+                if (isBlank(routeId)) {
+                    errors.add(label + " 的 routeIds 存在空值");
+                    continue;
+                }
+                if (!withinPolicy.add(routeId)) {
+                    errors.add(label + " 的 routeIds 内路由重复: " + routeId);
+                }
+                if (!existingRouteIds.contains(routeId)) {
+                    errors.add(label + " 引用了不存在的路由: " + routeId);
+                }
+                String previous = routeOwner.putIfAbsent(routeId, q.id());
+                if (previous != null) {
+                    errors.add(String.format(
+                            "路由 %s 同时归属配额策略 %s 与 %s，一条路由最多属于一份配额",
+                            routeId, previous, q.id()));
+                }
+            }
+        }
     }
 
     private void validateUpstreams(GatewayConfig config, List<String> errors) {
