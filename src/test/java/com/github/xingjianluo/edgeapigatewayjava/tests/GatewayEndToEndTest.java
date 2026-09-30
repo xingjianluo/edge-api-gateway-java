@@ -49,10 +49,23 @@ class GatewayEndToEndTest {
     /** 每个用例前原子装入指向本进程端口的完整配置（高配额，避免用例间互相限流）。 */
     @BeforeEach
     void installConfig() {
-        configService.replaceFromJson(configJson("true", 1000, 1000));
+        configService.replaceFromJson(configJson("true", 1000, 1000, 0L));
     }
 
     private String configJson(String enabled, double globalRate, double callerRate) {
+        return configJson(enabled, globalRate, callerRate, 0L);
+    }
+
+    /**
+     * @param quotaLimit 共享周期配额的额度；&lt;=0 表示不下发任何 quotas（且路由不带 quotaId）
+     */
+    private String configJson(String enabled, double globalRate, double callerRate, long quotaLimit) {
+        boolean withQuota = quotaLimit > 0;
+        String quotaRef = withQuota ? ",\"quotaId\":\"shared-budget\"" : "";
+        String quotas = withQuota
+                ? ",\"quotas\":[{\"id\":\"shared-budget\",\"limit\":" + quotaLimit
+                        + ",\"resetPeriod\":\"DAY\",\"timeZone\":\"UTC\"}]"
+                : "";
         return """
                 {
                   "upstreams":[{"id":"demo","baseUrl":"http://127.0.0.1:%PORT%","enabled":%ENABLED%}],
@@ -65,17 +78,19 @@ class GatewayEndToEndTest {
                     {"id":"v1-api","pathPrefix":"/api/v1","upstream":"demo",
                      "prefixRewrite":"/__upstream","priority":20,"timeoutMillis":3000,"maxRetries":2,
                      "globalRatePerSecond":%GR%,"callerRatePerSecond":%CR%,
-                     "allowedCallers":["alpha","beta","gamma"]},
+                     "allowedCallers":["alpha","beta","gamma"]%QREF%},
                     {"id":"v2-api","pathPrefix":"/api/v2","upstream":"demo",
                      "prefixRewrite":"/__upstream","priority":30,"timeoutMillis":3000,"maxRetries":2,
-                     "globalRatePerSecond":%GR%,"callerRatePerSecond":%CR%}
-                  ]
+                     "globalRatePerSecond":%GR%,"callerRatePerSecond":%CR%%QREF%}
+                  ]%QUOTAS%
                 }
                 """
                 .replace("%PORT%", String.valueOf(port))
                 .replace("%ENABLED%", enabled)
                 .replace("%GR%", String.valueOf(globalRate))
-                .replace("%CR%", String.valueOf(callerRate));
+                .replace("%CR%", String.valueOf(callerRate))
+                .replace("%QREF%", quotaRef)
+                .replace("%QUOTAS%", quotas);
     }
 
     private ResponseEntity<String> exchange(String path, HttpMethod method,
@@ -264,6 +279,82 @@ class GatewayEndToEndTest {
                 ok.get(), explainable.get(), illegal.get());
         assertEquals(0, illegal.get(), "热更新期间不允许出现不可解释的结果或异常");
         assertTrue(ok.get() + explainable.get() == requestCount);
+    }
+
+    @Test
+    void 跨路由共享周期配额超额被拒且与按秒限流可区分且不影响他人() {
+        // alpha 在 v1-api 与 v2-api 两条共享 shared-budget 的路由上各有请求，合计每天 3 次
+        configService.replaceFromJson(configJson("true", 1000, 1000, 3L));
+
+        ResponseEntity<String> r1 = exchange("/api/v1/a", HttpMethod.GET, "alpha", "q-e2e-1", null, null);
+        ResponseEntity<String> r2 = exchange("/api/v2/b", HttpMethod.GET, "alpha", "q-e2e-2", null, null);
+        ResponseEntity<String> r3 = exchange("/api/v1/c", HttpMethod.GET, "alpha", "q-e2e-3", null, null);
+        ResponseEntity<String> r4 = exchange("/api/v2/d", HttpMethod.GET, "alpha", "q-e2e-4", null, null);
+        // beta 拥有独立周期额度，alpha 用尽对其无影响；未挂载配额的路由也不受影响
+        ResponseEntity<String> beta = exchange("/api/v1/e", HttpMethod.GET, "beta", "q-e2e-beta", null, null);
+
+        log.info("[端到端:共享配额] alpha v1/v2 前4次状态={},{},{},{}; beta={}",
+                r1.getStatusCode().value(), r2.getStatusCode().value(), r3.getStatusCode().value(),
+                r4.getStatusCode().value(), beta.getStatusCode().value());
+
+        assertEquals(HttpStatus.OK, r1.getStatusCode());
+        assertEquals(HttpStatus.OK, r2.getStatusCode());
+        assertEquals(HttpStatus.OK, r3.getStatusCode());
+        assertEquals(HttpStatus.TOO_MANY_REQUESTS, r4.getStatusCode());
+        assertTrue(r4.getBody().contains("QUOTA_EXHAUSTED"),
+                "周期配额超额必须返回独立 code，不能与 RATE_LIMITED_* 混淆");
+        assertTrue(!r4.getBody().contains("RATE_LIMITED_CALLER"));
+        assertEquals(HttpStatus.OK, beta.getStatusCode(), "其他调用方不受影响");
+    }
+
+    @Test
+    void 周期配额拒绝的请求不会被转发到上游() throws Exception {
+        configService.replaceFromJson(configJson("true", 1000, 1000, 1L));
+        ResponseEntity<String> first = exchange("/api/v1/once", HttpMethod.GET, "alpha", "q-block-1", null, null);
+        assertEquals(HttpStatus.OK, first.getStatusCode());
+
+        // 第二次起周期配额已用尽：必须在网关入口直接拒绝，绝不能到达上游
+        for (int i = 0; i < 3; i++) {
+            ResponseEntity<String> blocked =
+                    exchange("/api/v1/blocked" + i, HttpMethod.GET, "alpha", "q-block-" + (i + 2), null, null);
+            assertEquals(HttpStatus.TOO_MANY_REQUESTS, blocked.getStatusCode());
+            assertTrue(blocked.getBody().contains("QUOTA_EXHAUSTED"));
+            // demo 上游 /__upstream/ok 回显体固定含 upstream 字段；被网关配额拦截的响应绝不能含它
+            assertTrue(!blocked.getBody().contains("\"upstream\""),
+                    "被周期配额拒绝的请求绝对不能发到上游");
+        }
+        log.info("[端到端:配额拦截不转发] 首次=200，随后3次全部429/QUOTA_EXHAUSTED且无上游回显体");
+    }
+
+    @Test
+    void 无关热更新保留周期已用额度而配额策略调整整体生效() {
+        configService.replaceFromJson(configJson("true", 1000, 1000, 3L));
+        exchange("/api/v1/u1", HttpMethod.GET, "alpha", "q-hot-1", null, null);
+        exchange("/api/v2/u2", HttpMethod.GET, "alpha", "q-hot-2", null, null);
+
+        // 仅切换上游 enabled（与配额无关）：已用 2 次必须保留，再用 1 次即超额
+        configService.replaceFromJson(configJson("true", 1000, 1000, 3L));
+        ResponseEntity<String> third = exchange("/api/v1/u3", HttpMethod.GET, "alpha", "q-hot-3", null, null);
+        ResponseEntity<String> fourth = exchange("/api/v1/u4", HttpMethod.GET, "alpha", "q-hot-4", null, null);
+        log.info("[端到端:无关热更新] 已用2次后重载(无关变更) 第3次={}, 第4次={}",
+                third.getStatusCode().value(), fourth.getStatusCode().value());
+        assertEquals(HttpStatus.OK, third.getStatusCode());
+        assertEquals(HttpStatus.TOO_MANY_REQUESTS, fourth.getStatusCode());
+        assertTrue(fourth.getBody().contains("QUOTA_EXHAUSTED"), "无关热更新绝不能清空周期已用额度");
+
+        // 调整配额策略：总额度从 3 改为 1。已用 2 >= 1，alpha 必须立即被拒（改小不能多用）
+        configService.replaceFromJson(configJson("true", 1000, 1000, 1L));
+        ResponseEntity<String> afterShrink = exchange("/api/v1/u5", HttpMethod.GET, "alpha", "q-hot-5", null, null);
+        // 新调用方在新上限下也只能用 1 次
+        ResponseEntity<String> gamma1 = exchange("/api/v1/g1", HttpMethod.GET, "gamma", "q-hot-g1", null, null);
+        ResponseEntity<String> gamma2 = exchange("/api/v1/g2", HttpMethod.GET, "gamma", "q-hot-g2", null, null);
+        log.info("[端到端:策略调整] limit 3->1 后 alpha={}, gamma第1次={}, 第2次={}",
+                afterShrink.getStatusCode().value(), gamma1.getStatusCode().value(), gamma2.getStatusCode().value());
+        assertEquals(HttpStatus.TOO_MANY_REQUESTS, afterShrink.getStatusCode());
+        assertTrue(afterShrink.getBody().contains("QUOTA_EXHAUSTED"), "额度改小后绝不能反而多用");
+        assertEquals(HttpStatus.OK, gamma1.getStatusCode());
+        assertEquals(HttpStatus.TOO_MANY_REQUESTS, gamma2.getStatusCode());
+        assertTrue(gamma2.getBody().contains("QUOTA_EXHAUSTED"), "新上限必须对新请求整体生效");
     }
 
     private HttpHeaders jsonHeaders() {

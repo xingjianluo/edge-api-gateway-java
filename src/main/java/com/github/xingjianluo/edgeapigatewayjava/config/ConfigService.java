@@ -48,7 +48,7 @@ public class ConfigService {
     public ConfigService(ConfigLoader loader, ConfigValidator validator) {
         this.loader = loader;
         this.validator = validator;
-        this.current.set(new GatewayConfig(List.of(), java.util.Map.of()));
+        this.current.set(new GatewayConfig(List.of(), java.util.Map.of(), java.util.Map.of()));
     }
 
     @PostConstruct

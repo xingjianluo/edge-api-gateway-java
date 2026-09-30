@@ -11,6 +11,7 @@ public enum GatewayErrorCode {
     CALLER_FORBIDDEN("调用方不在该路由的允许名单中"),
     RATE_LIMITED_GLOBAL("超出路由维度限流配额"),
     RATE_LIMITED_CALLER("超出调用方维度限流配额"),
+    QUOTA_EXHAUSTED("超出调用方在该配额范围内的周期总额度"),
     REQUEST_DUPLICATED("相同幂等键的请求已被处理，拒绝重复计数"),
     UPSTREAM_TIMEOUT("上游处理超时"),
     UPSTREAM_CONNECT_FAILED("上游连接失败"),

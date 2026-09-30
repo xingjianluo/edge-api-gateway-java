@@ -68,7 +68,7 @@ public class GlobalExceptionHandler {
             case CALLER_MISSING -> 401;
             case CALLER_FORBIDDEN -> 403;
             case REQUEST_DUPLICATED -> 409;
-            case RATE_LIMITED_GLOBAL, RATE_LIMITED_CALLER -> 429;
+            case RATE_LIMITED_GLOBAL, RATE_LIMITED_CALLER, QUOTA_EXHAUSTED -> 429;
             case UPSTREAM_TIMEOUT, UPSTREAM_RETRIES_EXHAUSTED -> 504;
             case UPSTREAM_CIRCUIT_OPEN -> 503;
             case UPSTREAM_CONNECT_FAILED, UPSTREAM_BAD_RESPONSE, UPSTREAM_ERROR -> 502;

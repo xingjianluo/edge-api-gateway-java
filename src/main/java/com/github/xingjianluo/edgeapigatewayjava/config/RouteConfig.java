@@ -18,6 +18,8 @@ import java.util.Map;
  * @param globalRatePerSecond   路由维度每秒令牌数（0 表示不限）
  * @param callerRatePerSecond   调用方维度每秒令牌数（0 表示不限）
  * @param allowedCallers  允许的调用方名单；空表示任意已认证调用方
+ * @param quotaId         归属的周期配额范围 id（见 {@code GatewayConfig.quotas}）；
+ *                        null 表示该路由不参与任何周期配额
  */
 public record RouteConfig(
         String id,
@@ -31,11 +33,20 @@ public record RouteConfig(
         int maxRetries,
         double globalRatePerSecond,
         double callerRatePerSecond,
-        List<String> allowedCallers
+        List<String> allowedCallers,
+        String quotaId
 ) {
     public RouteConfig {
         methods = methods == null ? List.of() : List.copyOf(methods);
         requiredHeaders = requiredHeaders == null ? Map.of() : Map.copyOf(requiredHeaders);
         allowedCallers = allowedCallers == null ? List.of() : List.copyOf(allowedCallers);
+    }
+
+    /** 不归属任何周期配额的兼容构造器（quotaId=null）。 */
+    public RouteConfig(String id, String pathPrefix, List<String> methods, Map<String, String> requiredHeaders,
+                       String upstream, String prefixRewrite, int priority, long timeoutMillis, int maxRetries,
+                       double globalRatePerSecond, double callerRatePerSecond, List<String> allowedCallers) {
+        this(id, pathPrefix, methods, requiredHeaders, upstream, prefixRewrite, priority, timeoutMillis,
+                maxRetries, globalRatePerSecond, callerRatePerSecond, allowedCallers, null);
     }
 }

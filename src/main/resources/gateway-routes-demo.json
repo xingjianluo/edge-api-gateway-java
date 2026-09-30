@@ -2,6 +2,9 @@
   "upstreams": [
     { "id": "demo", "baseUrl": "http://127.0.0.1:18080", "enabled": true }
   ],
+  "quotas": [
+    { "id": "hourly-budget", "limit": 10, "resetPeriod": "HOUR", "timeZone": "Asia/Shanghai" }
+  ],
   "routes": [
     {
       "id": "v2-orders-explicit",
@@ -27,7 +30,8 @@
       "maxRetries": 2,
       "globalRatePerSecond": 20,
       "callerRatePerSecond": 10,
-      "allowedCallers": ["alpha", "beta", "gamma"]
+      "allowedCallers": ["alpha", "beta", "gamma"],
+      "quotaId": "hourly-budget"
     },
     {
       "id": "v2-api",
@@ -38,7 +42,8 @@
       "timeoutMillis": 3000,
       "maxRetries": 2,
       "globalRatePerSecond": 20,
-      "callerRatePerSecond": 10
+      "callerRatePerSecond": 10,
+      "quotaId": "hourly-budget"
     },
     {
       "id": "health-route",

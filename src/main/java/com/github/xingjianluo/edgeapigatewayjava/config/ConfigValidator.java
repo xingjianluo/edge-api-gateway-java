@@ -2,6 +2,8 @@ package com.github.xingjianluo.edgeapigatewayjava.config;
 
 import org.springframework.stereotype.Component;
 
+import com.github.xingjianluo.edgeapigatewayjava.quota.QuotaPolicy;
+
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -29,8 +31,37 @@ public class ConfigValidator {
             return errors;
         }
         validateUpstreams(config, errors);
+        validateQuotas(config, errors);
         validateRoutes(config, errors);
         return errors;
+    }
+
+    private void validateQuotas(GatewayConfig config, List<String> errors) {
+        Set<String> ids = new HashSet<>();
+        for (QuotaPolicy q : config.quotas().values()) {
+            if (isBlank(q.id())) {
+                errors.add("存在缺少 id 的周期配额定义");
+                continue;
+            }
+            if (!ids.add(q.id())) {
+                errors.add("周期配额 id 重复: " + q.id());
+            }
+            if (q.limit() <= 0) {
+                errors.add("周期配额 " + q.id() + " 的 limit 必须为正数: " + q.limit());
+            }
+            if (q.resetPeriod() == null) {
+                errors.add("周期配额 " + q.id() + " 缺少合法的 resetPeriod(HOUR/DAY/WEEK)");
+            }
+            if (isBlank(q.timeZone())) {
+                errors.add("周期配额 " + q.id() + " 缺少 timeZone");
+            } else {
+                try {
+                    java.time.ZoneId.of(q.timeZone());
+                } catch (java.time.DateTimeException e) {
+                    errors.add("周期配额 " + q.id() + " 的 timeZone 非法: " + q.timeZone());
+                }
+            }
+        }
     }
 
     private void validateUpstreams(GatewayConfig config, List<String> errors) {
@@ -99,6 +130,9 @@ public class ConfigValidator {
                 if (isBlank(m)) {
                     errors.add(label + " 存在空 HTTP 方法");
                 }
+            }
+            if (!isBlank(r.quotaId()) && !config.quotas().containsKey(r.quotaId())) {
+                errors.add(label + " 引用了不存在的周期配额: " + r.quotaId());
             }
         }
         // 同优先级且条件可能重叠 => 确定性匹配会产生歧义

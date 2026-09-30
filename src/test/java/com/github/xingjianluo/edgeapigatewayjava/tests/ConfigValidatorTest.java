@@ -4,6 +4,8 @@ import com.github.xingjianluo.edgeapigatewayjava.config.ConfigValidator;
 import com.github.xingjianluo.edgeapigatewayjava.config.GatewayConfig;
 import com.github.xingjianluo.edgeapigatewayjava.config.RouteConfig;
 import com.github.xingjianluo.edgeapigatewayjava.config.UpstreamConfig;
+import com.github.xingjianluo.edgeapigatewayjava.quota.QuotaPolicy;
+import com.github.xingjianluo.edgeapigatewayjava.quota.QuotaResetPeriod;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -125,5 +127,51 @@ class ConfigValidatorTest {
         log.info("[用例:非法URL] baseUrl=ftp://nohost -> 错误={}", errors);
 
         assertTrue(errors.stream().anyMatch(e -> e.contains("http/https")));
+    }
+
+    @Test
+    void 合法的周期配额配置通过校验() {
+        QuotaPolicy q = new QuotaPolicy("budget", 100, QuotaResetPeriod.WEEK, "Asia/Shanghai");
+        RouteConfig r = new RouteConfig("a", "/a", List.of(), Map.of(), "u1",
+                null, 10, 1000, 0, 0, 0, List.of(), "budget");
+        GatewayConfig cfg = new GatewayConfig(
+                List.of(r),
+                Map.of("u1", new UpstreamConfig("u1", "http://127.0.0.1:9", true)),
+                Map.of("budget", q));
+        List<String> errors = validator.validate(cfg);
+        log.info("[用例:合法配额] quotaId=budget, limit=100/WEEK/Asia/Shanghai -> 错误={}", errors);
+        assertTrue(errors.isEmpty(), errors::toString);
+    }
+
+    @Test
+    void 路由引用不存在的配额被拒绝() {
+        RouteConfig r = new RouteConfig("a", "/a", List.of(), Map.of(), "u1",
+                null, 10, 1000, 0, 0, 0, List.of(), "ghost-budget");
+        GatewayConfig cfg = new GatewayConfig(
+                List.of(r),
+                Map.of("u1", new UpstreamConfig("u1", "http://127.0.0.1:9", true)),
+                Map.of());
+        List<String> errors = validator.validate(cfg);
+        log.info("[用例:幽灵配额引用] quotaId=ghost-budget 但无此策略 -> 错误={}", errors);
+        assertTrue(errors.stream().anyMatch(e -> e.contains("不存在的周期配额")));
+    }
+
+    @Test
+    void 配额重复id与非正额度与非法时区被拒绝() {
+        QuotaPolicy dupA = new QuotaPolicy("dup", 0, QuotaResetPeriod.DAY, "UTC");
+        QuotaPolicy dupB = new QuotaPolicy("dup", 5, QuotaResetPeriod.HOUR, "Not/AZone");
+        GatewayConfig cfg = new GatewayConfig(List.of(),
+                Map.of("u1", new UpstreamConfig("u1", "http://127.0.0.1:9", true)),
+                Map.of("dup", dupB));
+        // Map.of 无法保留重复 key，因此分别断言两种非法：非正额度 + 非法时区
+        List<String> errors = validator.validate(cfg);
+        log.info("[用例:非法配额] 非法时区+构造另测 limit=0 -> 错误={}", errors);
+        assertTrue(errors.stream().anyMatch(e -> e.contains("timeZone 非法")));
+
+        GatewayConfig zeroLimit = new GatewayConfig(List.of(),
+                Map.of("u1", new UpstreamConfig("u1", "http://127.0.0.1:9", true)),
+                Map.of("z", dupA));
+        List<String> zeroErrors = validator.validate(zeroLimit);
+        assertTrue(zeroErrors.stream().anyMatch(e -> e.contains("limit 必须为正数")));
     }
 }
