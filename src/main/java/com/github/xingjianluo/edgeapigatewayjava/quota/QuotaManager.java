@@ -41,6 +41,7 @@ public class QuotaManager {
     private static final Logger log = LoggerFactory.getLogger(QuotaManager.class);
 
     private final Clock clock;
+    private final ConfigService configService;
     /** key = quotaId；每个策略一张按调用方分桶的表。 */
     private final Map<String, PolicyState> states = new ConcurrentHashMap<>();
     /** 回收间隔：30s 扫描一次，过期窗口/历史调用方不会无限占内存。 */
@@ -49,32 +50,53 @@ public class QuotaManager {
     private volatile Thread sweeper;
 
     public QuotaManager() {
-        this(Clock.systemUTC());
+        this(Clock.systemUTC(), null);
     }
 
     public QuotaManager(Clock clock) {
-        this.clock = clock;
+        this(clock, null);
     }
 
     /** Spring 注入：订阅配置快照切换，按新快照对账配额状态。 */
     @org.springframework.beans.factory.annotation.Autowired
     public QuotaManager(ConfigService configService) {
-        this(Clock.systemUTC());
-        configService.addSwapListener(() -> reconcile(configService.current()));
+        this(Clock.systemUTC(), configService);
     }
 
-    /** 按新配置快照对账（订阅配置切换时使用）。 */
-    public void reconcile(GatewayConfig config) {
-        reconcile(config.quotas());
+    private QuotaManager(Clock clock, ConfigService configService) {
+        this.clock = clock;
+        this.configService = configService;
+        if (configService != null) {
+            configService.addSwapListener(() -> reconcile(configService.current()));
+        }
     }
 
+    /**
+     * 启动初始化：
+     * - 先按「初始配置」做一次首次对账，保证服务按初始配置启动后配额立即生效。
+     *   必须在这里而不能只依赖 swap 监听器：ConfigService 的初始加载发生在它自己的 @PostConstruct
+     *   中、且不发送切换通知（此时部分监听器尚未注册），只靠监听器会导致初始配额从未建账，
+     *   直到第一次热更新才生效。
+     * - 与运行期热更新走同一条 {@link #reconcile(Map)} 路径，启动语义与热更新语义不分叉；
+     *   该方法幂等且与请求热路径并发安全（putIfAbsent/retainAll 均为原子操作），
+     *   即使初始对账与首批请求/热更新并发也不会漏计、重复计数。
+     */
     @PostConstruct
     void start() {
+        if (configService != null) {
+            reconcile(configService.current());
+            log.info("[quota] 初始配额策略已按启动配置建账: 策略数={}", configService.current().quotas().size());
+        }
         Thread t = new Thread(this::sweepLoop, "gateway-quota-sweeper");
         t.setDaemon(true);
         sweeper = t;
         t.start();
         log.info("[quota] 过期窗口回收线程已启动, 间隔={}ms", SWEEP_INTERVAL_MILLIS);
+    }
+
+    /** 按新配置快照对账（订阅配置切换时使用）。 */
+    public void reconcile(GatewayConfig config) {
+        reconcile(config.quotas());
     }
 
     private void sweepLoop() {
