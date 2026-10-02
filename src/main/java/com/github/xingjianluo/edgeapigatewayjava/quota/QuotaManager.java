@@ -32,6 +32,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * - 配置热更新时按策略身份对账（见 {@link #reconcile(Map)}）：仅改超时/上游启停等与配额
  *   无关的配置时当前窗口已用额度保留；周期/时区变化的策略视为新窗口重新计账，额度/范围
  *   调整对新请求整体生效（沿用同窗口已用量套新上限，改小后绝不能多用）；
+ * - 「按初始配置启动」与热更新走同一个对账入口：{@link #start()} 在 Web 端口开放前按初始
+ *   快照先对账一次（且初始加载本身也会发出 swap 通知），因此启动后第一笔请求就受配额约束，
+ *   绝不依赖"先热更新一次"。启动期无并发请求，该对账幂等、不会与请求互相打架；
  * - 后台守护线程定期回收过期窗口与已删除策略的状态，历史调用方不会无限占用内存，
  *   也不会拖慢新请求（热路径只做一次 O(1) 哈希定位）。
  */
@@ -41,6 +44,7 @@ public class QuotaManager {
     private static final Logger log = LoggerFactory.getLogger(QuotaManager.class);
 
     private final Clock clock;
+    private final ConfigService configService;
     /** key = quotaId；每个策略一张按调用方分桶的表。 */
     private final Map<String, PolicyState> states = new ConcurrentHashMap<>();
     /** 回收间隔：30s 扫描一次，过期窗口/历史调用方不会无限占内存。 */
@@ -49,18 +53,25 @@ public class QuotaManager {
     private volatile Thread sweeper;
 
     public QuotaManager() {
-        this(Clock.systemUTC());
+        this(null, Clock.systemUTC());
     }
 
     public QuotaManager(Clock clock) {
-        this.clock = clock;
+        this(null, clock);
     }
 
     /** Spring 注入：订阅配置快照切换，按新快照对账配额状态。 */
     @org.springframework.beans.factory.annotation.Autowired
     public QuotaManager(ConfigService configService) {
-        this(Clock.systemUTC());
-        configService.addSwapListener(() -> reconcile(configService.current()));
+        this(configService, Clock.systemUTC());
+    }
+
+    private QuotaManager(ConfigService configService, Clock clock) {
+        this.configService = configService;
+        this.clock = clock;
+        if (configService != null) {
+            configService.addSwapListener(() -> reconcile(configService.current()));
+        }
     }
 
     /** 按新配置快照对账（订阅配置切换时使用）。 */
@@ -70,6 +81,15 @@ public class QuotaManager {
 
     @PostConstruct
     void start() {
+        // 按初始配置启动即对账：绝不依赖"必须先发生一次热更新"才有计数状态。
+        // 此时 ConfigService 的 @PostConstruct 已先于本 bean 完成（构造器注入强依赖保证），
+        // 初始快照就绪；即使初始加载曾通过监听器对账过，这里再对账一次也是幂等的
+        // （同一快照下同窗口用量保留），不会清零。
+        if (configService != null) {
+            reconcile(configService.current());
+            log.info("[quota] 初始配置对账完成（启动即生效），已装载配额策略数={}",
+                    configService.current().quotas().size());
+        }
         Thread t = new Thread(this::sweepLoop, "gateway-quota-sweeper");
         t.setDaemon(true);
         sweeper = t;

@@ -1,0 +1,56 @@
+{
+  "upstreams": [
+    { "id": "demo", "baseUrl": "http://127.0.0.1:18765", "enabled": true }
+  ],
+  "quotas": [
+    { "id": "shared-budget", "limit": 3, "resetPeriod": "DAY", "timeZone": "UTC" }
+  ],
+  "routes": [
+    {
+      "id": "v1-api",
+      "pathPrefix": "/api/v1",
+      "upstream": "demo",
+      "prefixRewrite": "/__upstream",
+      "priority": 20,
+      "timeoutMillis": 3000,
+      "maxRetries": 0,
+      "globalRatePerSecond": 1000,
+      "callerRatePerSecond": 1000,
+      "allowedCallers": ["alpha", "beta", "gamma"],
+      "quotaId": "shared-budget"
+    },
+    {
+      "id": "v2-api",
+      "pathPrefix": "/api/v2",
+      "upstream": "demo",
+      "prefixRewrite": "/__upstream",
+      "priority": 30,
+      "timeoutMillis": 3000,
+      "maxRetries": 0,
+      "globalRatePerSecond": 1000,
+      "callerRatePerSecond": 1000,
+      "quotaId": "shared-budget"
+    },
+    {
+      "id": "flaky-api",
+      "pathPrefix": "/api/flaky",
+      "upstream": "demo",
+      "prefixRewrite": "/__upstream/flaky",
+      "priority": 40,
+      "timeoutMillis": 3000,
+      "maxRetries": 2,
+      "globalRatePerSecond": 1000,
+      "callerRatePerSecond": 1000,
+      "quotaId": "shared-budget"
+    },
+    {
+      "id": "health-route",
+      "pathPrefix": "/health",
+      "upstream": "demo",
+      "prefixRewrite": "/__upstream/ok",
+      "priority": 50,
+      "timeoutMillis": 1000,
+      "maxRetries": 0
+    }
+  ]
+}

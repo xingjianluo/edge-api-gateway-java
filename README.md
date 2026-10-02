@@ -18,7 +18,7 @@ java -jar target/edge-api-gateway-java-1.0-SNAPSHOT.jar --spring.profiles.active
 # 正常转发（v1 路由 -> 内置上游 /__upstream/...）
 curl -s http://127.0.0.1:18080/api/v1/things -H 'X-Caller-Id: alpha'
 
-# 运行全部测试（59 个用例，完全离线）
+# 运行全部测试（70 个用例，完全离线；含「按初始配置启动、全程无热更新」的配额回归用例）
 mvn test
 ```
 
@@ -158,6 +158,58 @@ mvn test
 过期窗口由后台守护线程每 30 秒扫描回收（删除策略状态、清退历史调用方的旧窗口），
 长时间运行、调用方众多时不会无限占用内存；请求热路径只做一次 O(1) 哈希定位，
 历史调用方不会拖慢新请求。
+
+### 3.4 配额从什么时机开始生效：启动阶段 vs 热更新阶段
+
+共享配额在**服务接受第一个请求之前**就必须处于就绪状态，「带着配好共享配额的配置直接上线」
+是一等公民路径，不需要、也不应该依赖先做一次热更新：
+
+| 阶段 | 触发点 | 配额行为 |
+|---|---|---|
+| **按初始配置启动** | `ConfigService` 的 `@PostConstruct` 加载初始快照（classpath 默认 `gateway-routes.json`，或 `--gateway.config.path=` 指向的文件）；`QuotaManager` 在自身 `@PostConstruct` 再按初始快照对账一次 | 初始配置里的全部配额策略在 Web 端口对外服务**之前**完成装载，启动后第一笔请求就受配额约束。启动期没有并发请求（初始化先于端口监听），不存在漏计窗口 |
+| **运行期热更新** | 管理接口 `POST /__admin/config/reload`，或监听文件变更轮询到新内容 | 解析+校验通过后原子切换快照，随后按 3.3 的兼容表对账；校验失败则整份拒绝、旧配额继续生效 |
+
+两条路径都汇归到同一个 `reconcile(快照)`，且**初始加载本身也视为一次快照切换**
+（`ConfigService` 在初始 `set` 之后同样发出 swap 通知），因此不存在"只有热更新才建状态、
+启动时状态表为空导致全部放行"的分叉行为。`QuotaManager` 启动时的对账是幂等的：
+即使初始快照已通过监听器对账过，再对账一次也只会沿用同窗口已用量（此刻为 0），不会清零或重复计数。
+
+> 历史问题：此前初始加载只替换了配置引用、没有触发对账，`QuotaManager` 的计数状态表为空，
+> 导致按初始配置启动时所有配额检查都走"策略不在快照中→放行"分支，配额形同虚设；
+> 一旦运行过程中提交一次热更新才正常。现由「初始加载也发 swap 通知 + 管理器启动自身对账」双保险修复，
+> 并由 `QuotaStartupWiringTest`（装配层）与 `StartupQuotaEndToEndTest`（全程无热更新的真实 HTTP 用例）锁定。
+
+### 3.5 本机验证「按初始配置启动后直接复现超额拒绝」
+
+demo 配置 `gateway-routes-demo.json` 自带一条 `hourly-budget`（每调用方 10 次/小时，
+`Asia/Shanghai`），被 `/api/v1` 与 `/api/v2` 两条路由共享：
+
+```bash
+# 1) 构建并以 demo profile 启动（初始配置即带共享配额；启动后不要做任何热更新）
+mvn -q package -DskipTests
+java -jar target/edge-api-gateway-java-1.0-SNAPSHOT.jar --spring.profiles.active=demo
+# 启动日志中应能看到：
+#   [config] 初始配置已加载 ... quotas=1, 来源=classpath:gateway-routes-demo.json
+#   [quota] 初始配置对账完成（启动即生效），已装载配额策略数=1
+
+# 2) 同一调用方在两条共享路由上连发 12 次（另开一个终端）
+for i in $(seq 1 12); do
+  [ $i -le 6 ] && P=/api/v1/demo-$i || P=/api/v2/demo-$i
+  curl -s -o /dev/null -w "#$i $P -> %{http_code}\n" \
+    -H "X-Caller-Id: alpha" -H "X-Request-Id: manual-$i" \
+    http://127.0.0.1:18080$P
+done
+# 预期：#1~#10 返回 200（跨 v1/v2 合计共用 10 次额度），
+#       #11、#12 返回 429，响应体为 QUOTA_EXHAUSTED 且不含任何上游回显字段
+
+# 3) 旁证：另一调用方额度独立；缺身份 401 且不占额度；未挂配额的 /health 始终 200
+curl -s -o /dev/null -w "%{http_code}\n" -H "X-Caller-Id: beta"  -H "X-Request-Id: b1" http://127.0.0.1:18080/api/v1/b   # 200
+curl -s -o /dev/null -w "%{http_code}\n" -H "X-Request-Id: nc1" http://127.0.0.1:18080/api/v1/nc                        # 401 CALLER_MISSING
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18080/health                                                  # 200
+```
+
+> 窗口为整点翻转（HOUR/Asia/Shanghai）；若需反复验证，换一个 `X-Caller-Id` 即可获得独立的新额度，
+> 或把 demo 配置里的 `limit` 调得更小后重启（启动即生效，无需 reload）。
 
 ---
 

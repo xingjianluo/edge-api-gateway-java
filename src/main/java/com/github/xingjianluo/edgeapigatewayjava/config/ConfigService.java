@@ -57,8 +57,11 @@ public class ConfigService {
             InitialSource source = resolveInitialSource();
             GatewayConfig cfg = parseAndValidate(source.json());
             current.set(cfg);
-            log.info("[config] 初始配置已加载: routes={}, upstreams={}, 来源={}",
-                    cfg.routes().size(), cfg.upstreams().size(), source.description());
+            log.info("[config] 初始配置已加载: routes={}, upstreams={}, quotas={}, 来源={}",
+                    cfg.routes().size(), cfg.upstreams().size(), cfg.quotas().size(), source.description());
+            // 初始加载同样是一次"快照切换"：通知所有已注册监听器，
+            // 保证按初始配置启动时配额/限流等运行时状态即刻建立，无需任何热更新触发。
+            notifySwapped();
             if (watchedFile != null) {
                 startFileWatcher();
             }
